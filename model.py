@@ -44,6 +44,7 @@ class ModelArgs:
     rope_base: float = 10000
     norm_eps: float = 1e-5
     rope_scaling: Optional[dict] = None
+    has_qkv_bias: bool = False
 
     def __post_init__(self):
         if self.n_local_heads == -1:
@@ -77,7 +78,7 @@ transformer_configs = {
     "30B": dict(n_layer=60, n_head=52, dim=6656),
     "34B": dict(n_layer=48, n_head=64, dim=8192, vocab_size=32000, n_local_heads=8, intermediate_size=22016, rope_base=1000000), # CodeLlama-34B-Python-hf
     "70B": dict(n_layer=80, n_head=64, dim=8192, n_local_heads=8, intermediate_size=28672),
-    "Mistral-7B": dict(n_layer=32, n_head=32, n_local_heads=8, dim=4096, intermediate_size=14336, vocab_size=32000),
+    "Mistral-7B": dict(n_layer=32, n_head=32, n_local_heads=8, dim=4096, intermediate_size=14336, vocab_size=32768),
     "stories15M": dict(n_layer=6, n_head=6, dim=288),
     "stories110M": dict(n_layer=12, n_head=12, dim=768),
 
@@ -92,6 +93,10 @@ transformer_configs = {
     "llama-3.1-405b": dict(block_size=131072, n_layer=126, n_head=128, n_local_heads=8, dim=16384, intermediate_size=53248, vocab_size=128256, rope_base=500000,
         rope_scaling=dict(factor=8.0, low_freq_factor=1.0, high_freq_factor=4.0, original_max_position_embeddings=8192),
     ),
+    "Qwen2.5-7B-Instruct": dict(block_size=32768, n_layer=28, n_head=28, n_local_heads=4, dim=3584, intermediate_size=18944, vocab_size=152064, rope_base=1000000, 
+        norm_eps=1e-6, has_qkv_bias=True),
+    "Qwen2-0.5B-Instruct": dict(block_size=131072, n_layer=24, n_head=14, n_local_heads=2, dim=896, intermediate_size=4864, vocab_size=151936, rope_base=1000000, 
+        norm_eps=1e-6, has_qkv_bias=True), 
 }
 
 class KVCache(nn.Module):
@@ -184,7 +189,7 @@ class Attention(nn.Module):
 
         total_head_dim = (config.n_head + 2 * config.n_local_heads) * config.head_dim
         # key, query, value projections for all heads, but in a batch
-        self.wqkv = nn.Linear(config.dim, total_head_dim, bias=False)
+        self.wqkv = nn.Linear(config.dim, total_head_dim, bias=getattr(config, "has_qkv_bias", False))
         self.wo = nn.Linear(config.dim, config.dim, bias=False)
         self.kv_cache = None
 
@@ -200,6 +205,8 @@ class Attention(nn.Module):
             wk = state_dict.pop(prefix + "wk.weight")
             wv = state_dict.pop(prefix + "wv.weight")
             state_dict[prefix + "wqkv.weight"] = torch.cat([wq, wk, wv])
+        if prefix + "bqkv" in state_dict:
+            self.wqkv.bias = torch.nn.Parameter(state_dict.pop(prefix + "bqkv"))
 
     def forward(self, x: Tensor, freqs_cis: Tensor, mask: BlockMask, input_pos: Optional[Tensor] = None) -> Tensor:
         bsz, seqlen, _ = x.shape

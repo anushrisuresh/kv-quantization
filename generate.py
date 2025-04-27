@@ -38,7 +38,7 @@ wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
 from model import Transformer
-from tokenizer import get_tokenizer
+from tokenizer import get_tokenizer, QwenTokenizerWrapper
 
 def multinomial_sample_one_no_sync(probs_sort): # Does multinomial sampling without a cuda synchronization
     q = torch.empty_like(probs_sort).exponential_(1)
@@ -67,6 +67,8 @@ def causal_mask(b, h, q, kv):
 
 def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> torch.Tensor:
     # input_pos: [B, S]
+    print("[DEBUG] Inside prefill()")
+    print(f"[DEBUG] x.shape: {x.shape}, input_pos.shape: {input_pos.shape}")
     mask = create_block_mask(causal_mask, 1, 1, input_pos.shape[0], model.max_seq_length, device=x.device)
     logits = model(mask, x, input_pos)
     return sample(logits, **sampling_kwargs)[0]
@@ -166,7 +168,9 @@ def generate(
     """
     Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
     """
-
+    print("[DEBUG] Entered generate()")
+    print(f"[DEBUG] prompt shape: {prompt.shape}")
+    print(f"[DEBUG] batch_size = {batch_size}, max_new_tokens = {max_new_tokens}")
     is_speculative = draft_model is not None
     # create an empty tensor of the expected final shape and fill in the current tokens
     T = prompt.size(-1)
@@ -191,7 +195,9 @@ def generate(
     seq = empty
     input_pos = torch.arange(0, T, device=device)
 
+    print("[DEBUG] Calling prefill()")
     next_token = prefill(model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs).clone()
+    print("[DEBUG] Prefill completed, next token sampled.")
     if is_speculative:
         prefill(draft_model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs)
     seq[:, T] = next_token.squeeze()
@@ -216,6 +222,7 @@ def generate(
             input_pos = input_pos + num_added
             next_token = next_tokens[-1]
     else:
+        print("[DEBUG] Starting decode_n_tokens() loop")
         generated_tokens, _ = decode_n_tokens(model, next_token.view(batch_size, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
         seq[:, T + 1:] = torch.cat(generated_tokens, dim=-1)
 
@@ -303,8 +310,11 @@ def main(
     """
     assert checkpoint_path.is_file(), checkpoint_path
 
-    tokenizer_path = checkpoint_path.parent / "tokenizer.model"
-    assert tokenizer_path.is_file(), str(tokenizer_path)
+    if "Qwen" in str(checkpoint_path):
+        tokenizer_path = checkpoint_path.parent  # Use full HF dir for Qwen
+    else:
+        tokenizer_path = checkpoint_path.parent / "tokenizer.model"
+        assert tokenizer_path.is_file(), str(tokenizer_path)
 
     global print
     from tp import maybe_init_dist
@@ -323,7 +333,9 @@ def main(
     print("Loading model ...")
     t0 = time.time()
     model = _load_model(checkpoint_path, device, precision, use_tp)
-
+    print("[DEBUG] Model loaded successfully.")
+    print(f"[DEBUG] Model config: {model.config}")
+    print(f"[DEBUG] Model total parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
     if is_speculative:
         draft_model = _load_model(draft_checkpoint_path, device, precision, use_tp)
     else:
@@ -333,9 +345,13 @@ def main(
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
 
     tokenizer = get_tokenizer(tokenizer_path, checkpoint_path)
+    is_qwen = isinstance(tokenizer, QwenTokenizerWrapper)
+
+    print("[DEBUG] Tokenizer loaded successfully.")
 
     if isinstance(prompt, str):
         encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
+        print(f"[DEBUG] Prompt encoded, shape: {encoded.shape}, first 10 tokens: {encoded[:10].tolist()}")
     else:
         # generate a fully synthetic prompt
         encoded = torch.randint(0, 1024, (prompt,), device=device, dtype=torch.int64)
@@ -389,7 +405,28 @@ def main(
                     buffer.clear()
                 # print(, end='', flush=True)
         else:
-            callback = lambda x : x
+            if is_qwen:
+                # Special callback for Qwen models in non-interactive mode
+                buffer = []
+                period_id = tokenizer.encode('.')[0]
+                done_generating = False
+
+                def callback(x):
+                    nonlocal done_generating
+                    if done_generating:
+                        return
+                    # If you decode one token directly with some tokenizers (especially fast tokenizers like Hugging Face fast tokenizers), you might get garbage or nothing at all.
+	 	            # Prepending a “safe” character (.) gives context to the decoder, making sure decoding works properly even for small pieces.
+                    decoded = tokenizer.decode([period_id] + x.view(-1).tolist())[1:]
+                    buffer.append(decoded)
+                    if "<|im_end|>" in decoded:
+                        done_generating = True
+                    if len(buffer) == 4 or done_generating:
+                        print(''.join(buffer).replace("<|im_end|>", ""), end='', flush=True)
+                        buffer.clear()
+            else:
+                callback = lambda x: x
+
         t0 = time.perf_counter()
         import contextlib
         if (i != num_samples - 1 or not profile) or (use_tp and rank != 0):
