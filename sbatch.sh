@@ -12,5 +12,11 @@ source ~/.bashrc
 module load anaconda
 conda activate ssm_hw6
 
+#Qwen
 # python generate.py --prompt "What is the Capital of Argentina?" --checkpoint_path checkpoints/Qwen/Qwen2.5-7B-Instruct/model.pth --num_samples 1 --max_new_tokens 50 --device cuda
-python generate.py --prompt "What is the Capital of Argentina?" --checkpoint_path checkpoints/Qwen2-0.5B-Instruct/model.pth --num_samples 1 --max_new_tokens 50 --device cuda
+
+#Mistral
+# python generate.py --prompt "What is the Capital of Argentina?" --checkpoint_path checkpoints/Mistral-7B/model.pth --num_samples 1 --max_new_tokens 50 --device cuda
+
+#Long prompt - test
+python generate.py --prompt "Explain the theory of general relativity in detail, including its historical background, the mathematical formulation using tensors, and the modern experimental evidence supporting it. Discuss implications on time dilation, black holes, and gravitational waves." --checkpoint_path checkpoints/Mistral-7B/model.pth --num_samples 1 --max_new_tokens 512 --device cuda
