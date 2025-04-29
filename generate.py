@@ -154,11 +154,11 @@ def speculative_decode(
 def generate(
     model: Transformer,
     prompt: torch.Tensor,
-    max_new_tokens: int,
-    batch_size: int,
+    max_new_tokens: int = 100,
+    batch_size: int = 1,
     *,
-    interactive: bool,
-    draft_model: Transformer,
+    interactive: bool = False,
+    draft_model: Optional[Transformer] = None,
     speculate_k: Optional[int] = 8,
     callback = lambda x: x,
     **sampling_kwargs
@@ -452,33 +452,39 @@ def main(
 
 
 if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser(description='Your CLI description.')
+    try:
+        import argparse
+        parser = argparse.ArgumentParser(description='Your CLI description.')
 
-    def int_or_str(x):
-        try:
-            return int(x)
-        except:
-            return x
+        def int_or_str(x):
+            try:
+                return int(x)
+            except:
+                return x
 
-    parser.add_argument('--prompt', type=int_or_str, default="Hello, my name is", help="Input prompt. If it's an integer, will instead generate a synthetic prompt.")
-    parser.add_argument('--interactive', action='store_true', help='Whether to launch in interactive mode')
-    parser.add_argument('--num_samples', type=int, default=5, help='Number of samples.')
-    parser.add_argument('--max_new_tokens', type=int, default=200, help='Maximum number of new tokens.')
-    parser.add_argument('--batch_size', type=int, default=1, help='Batch size to benchmark with')
-    parser.add_argument('--top_k', type=int, default=200, help='Top-k for sampling.')
-    parser.add_argument('--temperature', type=float, default=0.8, help='Temperature for sampling.')
-    parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')
-    parser.add_argument('--compile', action='store_true', help='Whether to compile the model.')
-    parser.add_argument('--compile_prefill', action='store_true', help='Whether to compile the prefill (improves prefill perf, but higher compile times)')
-    parser.add_argument('--profile', type=Path, default=None, help='Profile path.')
-    parser.add_argument('--speculate_k', type=int, default=5, help='Speculative execution depth.')
-    parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
-    parser.add_argument('--device', type=str, default=default_device, help='Device to use')
+        parser.add_argument('--prompt', type=int_or_str, default="Hello, my name is", help="Input prompt. If it's an integer, will instead generate a synthetic prompt.")
+        parser.add_argument('--interactive', action='store_true', help='Whether to launch in interactive mode')
+        parser.add_argument('--num_samples', type=int, default=5, help='Number of samples.')
+        parser.add_argument('--max_new_tokens', type=int, default=200, help='Maximum number of new tokens.')
+        parser.add_argument('--batch_size', type=int, default=1, help='Batch size to benchmark with')
+        parser.add_argument('--top_k', type=int, default=200, help='Top-k for sampling.')
+        parser.add_argument('--temperature', type=float, default=0.8, help='Temperature for sampling.')
+        parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')
+        parser.add_argument('--compile', action='store_true', help='Whether to compile the model.')
+        parser.add_argument('--compile_prefill', action='store_true', help='Whether to compile the prefill (improves prefill perf, but higher compile times)')
+        parser.add_argument('--profile', type=Path, default=None, help='Profile path.')
+        parser.add_argument('--speculate_k', type=int, default=5, help='Speculative execution depth.')
+        parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
+        parser.add_argument('--device', type=str, default=default_device, help='Device to use')
 
-    args = parser.parse_args()
-    main(
-        args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.batch_size, args.top_k,
-        args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
-        args.speculate_k, args.device
-    )
+        args = parser.parse_args()
+        print("start main")
+        main(
+            args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.batch_size, args.top_k,
+            args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
+            args.speculate_k, args.device
+        )
+    except Exception as e:
+        import traceback
+        print("ERROR during execution:", e)
+        traceback.print_exc()
