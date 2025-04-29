@@ -15,8 +15,10 @@ from torch.nn.attention.flex_attention import (
     _mask_mod_signature,
     BlockMask,
     flex_attention,
+    create_block_mask
 )
-
+from mask_utils import causal_mask
+from kv_compression import KVCompressor
 
 def find_multiple(n: int, k: int) -> int:
     if n % k == 0:
@@ -198,6 +200,12 @@ class Attention(nn.Module):
         self.n_local_heads = config.n_local_heads
         self.dim = config.dim
         self._register_load_state_dict_pre_hook(self.load_hook)
+        
+        self.kv_compressor = KVCompressor(
+            enabled=False,
+            window_size=None,
+            sink_size=0
+        )
 
     def load_hook(self, state_dict, prefix, *args):
         if prefix + "wq.weight" in state_dict:
@@ -226,6 +234,38 @@ class Attention(nn.Module):
         if self.kv_cache is not None:
             k, v = self.kv_cache.update(input_pos, k, v)
 
+        mask_override = None
+        if self.kv_compressor is not None and self.kv_compressor.enabled:
+            k, v, mask_override = self.kv_compressor.compress(k, v, input_pos.detach())
+
+        if mask_override is not None:
+            if input_pos.shape[0] != 1:
+                raise NotImplementedError("KV compression currently only supports batch_size=1.")
+
+            kv_positions = mask_override["kv_positions"]
+
+            def compressed_causal_mask(b, h, q, kv):
+                return input_pos[0] >= kv_positions[kv]
+
+            mask = create_block_mask(
+                compressed_causal_mask,
+                B=1,
+                H=1,
+                Q_LEN=q.shape[2],
+                KV_LEN=k.shape[2],
+                device=k.device,
+            )
+
+        elif q.shape[2] != mask.shape[2] or k.shape[2] != mask.shape[3]:
+            mask = create_block_mask(
+                causal_mask,
+                B=1,
+                H=1,
+                Q_LEN=q.shape[2],
+                KV_LEN=k.shape[2],
+                device=k.device,
+            )
+                    
         y = flex_attention(q, k, v, block_mask=mask, enable_gqa=(self.n_head != self.n_local_heads))
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
