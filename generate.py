@@ -66,52 +66,50 @@ def causal_mask(b, h, q, kv):
     return q >= kv
 
 def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> torch.Tensor:
-    # input_pos: [B, S]
     print("[DEBUG] Inside prefill()")
     print(f"[DEBUG] x.shape: {x.shape}, input_pos.shape: {input_pos.shape}")
-    input_pos = input_pos.view(-1)  # <<< ADD THIS LINE
-    print(f"[DEBUG] After view(-1), input_pos.shape: {input_pos.shape}")
+    input_pos = input_pos.view(-1)
 
-    # ======= BEGIN: TEMPORARILY DISABLE KV COMPRESSION =======
-    compression_states = []
-    for layer in model.layers:
-        if layer.attention.kv_compressor is not None:
-            compression_states.append(layer.attention.kv_compressor.enabled)
-            layer.attention.kv_compressor.enabled = False
-        else:
-            compression_states.append(None)
-    # ======= END =======
+    Q_LEN = x.size(1)
+    
+    # dynamically determine KV_LEN
+    attn = model.layers[0].attention
+    if getattr(attn.kv_cache, "compress", False):
+        KV_LEN = attn.kv_cache.k_cache.shape[2]  # sink + window
+    else:
+        KV_LEN = model.max_seq_length
+    mask = create_block_mask(causal_mask, 1, 1, Q_LEN, KV_LEN, device=x.device)
 
-    mask = create_block_mask(causal_mask, 1, 1, input_pos.shape[0], model.max_seq_length, device=x.device)
-    logits = model(mask, x, input_pos)
-
-    # ======= BEGIN: RESTORE KV COMPRESSION =======
-    for layer, state in zip(model.layers, compression_states):
-        if state is not None:
-            layer.attention.kv_compressor.enabled = state
-    # ======= END =======
+    logits = model(mask, x, input_pos, prefill_mode=True)
 
     return sample(logits, **sampling_kwargs)[0]
 
 def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, block_mask: BlockMask, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
-    # input_pos: [B, 1]
-    assert input_pos.shape[-1] == 1
+    assert input_pos.shape[-1] == 1, "input_pos must be shape [B, 1]"
+
+    # Step 1: Select the block slice
     block_index = input_pos // block_mask.BLOCK_SIZE[0]
-    mask = block_mask[:, :, block_index]
-    mask.mask_mod = block_mask.mask_mod
-    mask.seq_lengths = (1, model.max_seq_length)
-    logits = model(mask, x, input_pos)
+    mask = block_mask[:, :, block_index]  # [1, H, 1, block_size]
+    mask.mask_mod = block_mask.mask_mod  # pass-through (may be updated inside model)
+
+    # Step 2: Adjust kv_len to current compressed length
+    kv_cache = model.layers[0].attention.kv_cache
+    if getattr(kv_cache, "compress", False):
+        # compressed buffer
+        kv_len = kv_cache.k_cache.shape[2]
+        mask.seq_lengths = (1, kv_len)
+    else:
+        # full-length
+        mask.seq_lengths = (1, model.max_seq_length)
+
+    logits = model(mask, x, input_pos, prefill_mode=False)
+
     return sample(logits, **sampling_kwargs)
 
 def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, callback=lambda _: _, **sampling_kwargs):
     block_mask = create_block_mask(causal_mask, 1, 1, model.max_seq_length, model.max_seq_length, device=cur_token.device)
     new_tokens, new_probs = [], []
     for i in range(num_new_tokens):
-        # print(f"[DEBUG] decode_n_tokens step={i}")
-        # print(f"[DEBUG] cur_token shape={cur_token.shape}, input_pos={input_pos.shape}")
-        # print(f"[DEBUG] block_mask shape={block_mask.shape if hasattr(block_mask, 'shape') else 'no shape'}")
-        # print(f"[DEBUG] KV cache shape={model.layers[0].attention.kv_cache.k_cache.shape}")
-        # print(f"[DEBUG] KV cache lengths: num_heads={model.layers[0].attention.kv_cache.k_cache.shape[1]}, kv_len={model.layers[0].attention.kv_cache.k_cache.shape[2]}")
         next_token, next_prob = decode_one_token(
             model, cur_token, input_pos, block_mask, **sampling_kwargs
         )
@@ -330,6 +328,9 @@ def main(
     draft_checkpoint_path: Optional[Path] = None,
     speculate_k: int = 5,
     device=default_device,
+    compress_kv: bool = False,
+    window_size: int = None,
+    sink_size: int = 0,
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
     """
@@ -362,11 +363,11 @@ def main(
     print(f"[DEBUG] Model config: {model.config}")
     print(f"[DEBUG] Model total parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
 
-    if args.compress_kv:
+    if compress_kv:
         for layer in model.layers:
             layer.attention.kv_compressor.enabled = True
-            layer.attention.kv_compressor.window_size = args.window_size
-            layer.attention.kv_compressor.sink_size = args.sink_size
+            layer.attention.kv_compressor.window_size = window_size
+            layer.attention.kv_compressor.sink_size = sink_size
 
     if is_speculative:
         draft_model = _load_model(draft_checkpoint_path, device, precision, use_tp)
@@ -552,5 +553,5 @@ if __name__ == '__main__':
     main(
         args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.batch_size, args.top_k,
         args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
-        args.speculate_k, args.device
+        args.speculate_k, args.device, args.compress_kv, args.window_size, args.sink_size
     )
