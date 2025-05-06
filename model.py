@@ -19,7 +19,6 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
     create_block_mask
 )
-from mask_utils import causal_mask
 from kv_compression import KVCompressor
 
 def find_multiple(n: int, k: int) -> int:
@@ -192,39 +191,23 @@ class KVCache(nn.Module):
         self.prefill_done = True
         return compressed_k, compressed_v
 
-    def update(self, input_pos: Tensor, k_new: Tensor, v_new: Tensor):
+    def update(self, input_pos: Tensor, k: Tensor, v: Tensor):
         """
-        Append or slide in new KV. Called every decode step.
-
-        Args:
-            input_pos: [1] tensor of current absolute token index
-            k_new, v_new:
-                - if compress=False: [B, H, S, D] with S tokens
-                - if compress=True: [B, H, 1, D]
-        Returns:
-            (k_cache, v_cache)
+        k, v: [B, H, 1, D] during decode
+        input_pos: [1] absolute position
         """
         if not self.compress:
-            # full mode: simply write into absolute pos
-            pos = input_pos.item()
-            self.k_cache[:, :, pos] = k_new.squeeze(2)
-            self.v_cache[:, :, pos] = v_new.squeeze(2)
-            return self.k_cache, self.v_cache
-
-        # compressed mode: sliding window update
-        assert self.prefill_done, "Must call prefill_update before update"
-        # circular write index
-        idx = self.sink + self.ptr
-        self.k_cache[:, :, idx] = k_new.squeeze(2)
-        self.v_cache[:, :, idx] = v_new.squeeze(2)
-        # map this slot to absolute position
-        pos = input_pos.item()
-        self.kv_positions[idx] = pos
-        # advance pointer
-        self.ptr = (self.ptr + 1) % self.window
-
+            self.k_cache[:, :, input_pos] = k  # no .squeeze() or .item()
+            self.v_cache[:, :, input_pos] = v
+        else:
+            if self.compress:
+                assert self.prefill_done, "Must call prefill_update before update"
+            idx = self.sink + self.ptr
+            self.k_cache[:, :, idx] = k.squeeze(2)
+            self.v_cache[:, :, idx] = v.squeeze(2)
+            self.kv_positions[idx] = input_pos.item()
+            self.ptr = (self.ptr + 1) % self.window
         return self.k_cache, self.v_cache
-
 
 class Transformer(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
@@ -399,16 +382,12 @@ class Attention(nn.Module):
                         return orig_pos[kv_idx] <= cur_base + q_idx
                     mask.mask_mod = new_mask_mod
  
-        torch.cuda.synchronize()
-        start = time.time()
         # 7) perform attention
         y = flex_attention(
             q, k, v,
             block_mask=mask,
             enable_gqa=(self.n_head != self.n_local_heads)
         )
-        torch.cuda.synchronize()
-        print(f"[TIMING] flex_attention time: {time.time() - start:.6f} sec")
 
         # 8) project out and return
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
