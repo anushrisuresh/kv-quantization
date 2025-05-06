@@ -38,7 +38,7 @@ wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
 from model import Transformer
-from tokenizer import get_tokenizer, QwenTokenizerWrapper
+from tokenizer import get_tokenizer
 
 def multinomial_sample_one_no_sync(probs_sort): # Does multinomial sampling without a cuda synchronization
     q = torch.empty_like(probs_sort).exponential_(1)
@@ -68,20 +68,17 @@ def causal_mask(b, h, q, kv):
 def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> torch.Tensor:
     print("[DEBUG] Inside prefill()")
     print(f"[DEBUG] x.shape: {x.shape}, input_pos.shape: {input_pos.shape}")
-    input_pos = input_pos.view(-1)
+    kv_cache = model.layers[0].attention.kv_cache
+    kv_len = kv_cache.k_cache.shape[2] if kv_cache.compress else model.max_seq_length
 
-    Q_LEN = x.size(1)
-    
-    # dynamically determine KV_LEN
-    attn = model.layers[0].attention
-    if getattr(attn.kv_cache, "compress", False):
-        KV_LEN = attn.kv_cache.k_cache.shape[2]  # sink + window
-    else:
-        KV_LEN = model.max_seq_length
-    mask = create_block_mask(causal_mask, 1, 1, Q_LEN, KV_LEN, device=x.device)
+    mask = create_block_mask(
+        causal_mask, 1, 1,
+        Q_LEN := x.size(1),
+        kv_len,
+        device=x.device
+    )
 
     logits = model(mask, x, input_pos, prefill_mode=True)
-
     return sample(logits, **sampling_kwargs)[0]
 
 def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, block_mask: BlockMask, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -94,10 +91,8 @@ def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tenso
 
     # Step 2: Adjust kv_len to current compressed length
     kv_cache = model.layers[0].attention.kv_cache
-    if getattr(kv_cache, "compress", False):
-        # compressed buffer
-        kv_len = kv_cache.k_cache.shape[2]
-        mask.seq_lengths = (1, kv_len)
+    if kv_cache.compress:
+        mask.seq_lengths = (1, kv_cache.k_cache.shape[2])
     else:
         # full-length
         mask.seq_lengths = (1, model.max_seq_length)
@@ -336,11 +331,8 @@ def main(
     """
     assert checkpoint_path.is_file(), checkpoint_path
 
-    if "Qwen" in str(checkpoint_path):
-        tokenizer_path = checkpoint_path.parent  # Use full HF dir for Qwen
-    else:
-        tokenizer_path = checkpoint_path.parent / "tokenizer.model"
-        assert tokenizer_path.is_file(), str(tokenizer_path)
+    tokenizer_path = checkpoint_path.parent / "tokenizer.model"
+    assert tokenizer_path.is_file(), str(tokenizer_path)
 
     global print
     from tp import maybe_init_dist
@@ -378,7 +370,6 @@ def main(
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
 
     tokenizer = get_tokenizer(tokenizer_path, checkpoint_path)
-    is_qwen = isinstance(tokenizer, QwenTokenizerWrapper)
 
     print("[DEBUG] Tokenizer loaded successfully.")
 
@@ -438,27 +429,7 @@ def main(
                     buffer.clear()
                 # print(, end='', flush=True)
         else:
-            if is_qwen:
-                # Special callback for Qwen models in non-interactive mode
-                buffer = []
-                period_id = tokenizer.encode('.')[0]
-                done_generating = False
-
-                def callback(x):
-                    nonlocal done_generating
-                    if done_generating:
-                        return
-                    # If you decode one token directly with some tokenizers (especially fast tokenizers like Hugging Face fast tokenizers), you might get garbage or nothing at all.
-	 	            # Prepending a “safe” character (.) gives context to the decoder, making sure decoding works properly even for small pieces.
-                    decoded = tokenizer.decode([period_id] + x.view(-1).tolist())[1:]
-                    buffer.append(decoded)
-                    if "<|im_end|>" in decoded:
-                        done_generating = True
-                    if len(buffer) == 4 or done_generating:
-                        print(''.join(buffer).replace("<|im_end|>", ""), end='', flush=True)
-                        buffer.clear()
-            else:
-                callback = lambda x: x
+            callback = lambda x: x
 
         t0 = time.perf_counter()
         import contextlib
