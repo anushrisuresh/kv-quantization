@@ -19,7 +19,6 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
     create_block_mask
 )
-from mask_utils import causal_mask
 from kv_compression import KVCompressor
 
 def find_multiple(n: int, k: int) -> int:
