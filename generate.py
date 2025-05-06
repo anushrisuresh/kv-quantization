@@ -380,6 +380,8 @@ def main(
     speculate_k: int = 5,
     device=default_device,
     compress_kv: bool = False,
+    quantize_kv: bool = False,
+    quant_type: str = "int8",
     window_size: int = None,
     sink_size: int = 0,
 ) -> None:
@@ -416,6 +418,13 @@ def main(
             layer.attention.kv_compressor.enabled = True
             layer.attention.kv_compressor.window_size = window_size
             layer.attention.kv_compressor.sink_size = sink_size
+    
+    #new change
+    if quantize_kv:
+        from kv_quantization import KVQuantizer
+        kv_quantizer = KVQuantizer(enabled=True, quant_type=quant_type, sink_size=sink_size, window_size=window_size)
+    else:
+        kv_quantizer = None
 
     if is_speculative:
         draft_model = _load_model(draft_checkpoint_path, device, precision, use_tp)
@@ -598,12 +607,16 @@ if __name__ == '__main__':
     parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
     parser.add_argument('--device', type=str, default=default_device, help='Device to use')
     parser.add_argument('--compress_kv', action='store_true', help='Enable attention kv compression')
+    parser.add_argument('--quantize_kv', action='store_true', help='Enable partial quantization of KV cache')
+    parser.add_argument('--quant_type', type=str, default='int8', help='Quantization type (e.g., int8, int4)')    
     parser.add_argument('--window_size', type=int, default=None, help='Window size for attention sliding window')
     parser.add_argument('--sink_size', type=int, default=0, help='Attention sink size')
 
     args = parser.parse_args()
+    #new change
+    assert not (args.compress_kv and args.quantize_kv), "Cannot compress_kv and quantize_kv together"
     main(
         args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.batch_size, args.top_k,
         args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
-        args.speculate_k, args.device, args.compress_kv, args.window_size, args.sink_size
+        args.speculate_k, args.device, args.compress_kv, args.quantize_kv, args.quant_type, args.window_size, args.sink_size
     )

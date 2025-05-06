@@ -20,6 +20,8 @@ from torch.nn.attention.flex_attention import (
     create_block_mask
 )
 from kv_compression import KVCompressor
+#new changes
+from kv_quantization import KVQuantizer
 
 def find_multiple(n: int, k: int) -> int:
     if n % k == 0:
@@ -128,10 +130,17 @@ class KVCache(nn.Module):
         compress: bool = False,
         sink_size: int = 0,
         window_size: int = None,
-        dtype: torch.dtype = torch.bfloat16
+        dtype: torch.dtype = torch.bfloat16,
+        #new change
+        quantize: bool = False,
+        quantizer: KVQuantizer = None
     ):
         super().__init__()
         self.compress = compress
+        #new change
+        self.quantize = quantize
+        self.quantizer = quantizer
+
         if not compress:
             # Full KV cache: preallocate for max_seq_length
             cache_shape = (max_batch_size, n_heads, max_seq_length, head_dim)
@@ -197,6 +206,7 @@ class KVCache(nn.Module):
         input_pos: [1] absolute position
         """
         if not self.compress:
+<<<<<<< Updated upstream
             self.k_cache[:, :, input_pos] = k  # no .squeeze() or .item()
             self.v_cache[:, :, input_pos] = v
         else:
@@ -207,6 +217,38 @@ class KVCache(nn.Module):
             self.v_cache[:, :, idx] = v.squeeze(2)
             self.kv_positions[idx] = input_pos.item()
             self.ptr = (self.ptr + 1) % self.window
+=======
+            # full mode: simply write into absolute pos
+            pos = input_pos.item()
+            self.k_cache[:, :, pos] = k_new.squeeze(2)
+            self.v_cache[:, :, pos] = v_new.squeeze(2)
+            return self.k_cache, self.v_cache
+
+        # compressed mode: sliding window update
+        assert self.prefill_done, "Must call prefill_update before update"
+        # circular write index
+        idx = self.sink + self.ptr
+        self.k_cache[:, :, idx] = k_new.squeeze(2)
+        self.v_cache[:, :, idx] = v_new.squeeze(2)
+        # map this slot to absolute position
+        pos = input_pos.item()
+        self.kv_positions[idx] = pos
+        # advance pointer
+        self.ptr = (self.ptr + 1) % self.window
+        #new change
+        if self.quantize and self.quantizer is not None:
+            # preserve sink and newest window: quantize everything else
+            start = self.quantizer.sink_size
+            end   = self.sink + self.window - self.quantizer.window_size
+            if end > start:
+                # slice the old‐tokens region
+                k_mid = self.k_cache[:, :, start:end]
+                v_mid = self.v_cache[:, :, start:end]
+                # call into our helper
+                self.k_cache[:, :, start:end] = self.quantizer.quantize_tensor(k_mid)
+                self.v_cache[:, :, start:end] = self.quantizer.quantize_tensor(v_mid)
+
+>>>>>>> Stashed changes
         return self.k_cache, self.v_cache
 
 class Transformer(nn.Module):
@@ -248,7 +290,10 @@ class Transformer(nn.Module):
                 dtype=attn.wqkv.weight.dtype,
                 compress=attn.kv_compressor.enabled if attn.kv_compressor else False,
                 sink_size=attn.kv_compressor.sink_size if attn.kv_compressor else 0,
-                window_size=attn.kv_compressor.window_size if attn.kv_compressor else 0
+                window_size=attn.kv_compressor.window_size if attn.kv_compressor else 0,
+                #new changes
+                quantize=attn.kv_quantizer.enabled if attn.kv_quantizer else False,
+                quantizer=attn.kv_quantizer if attn.kv_quantizer else 0
             )
 
         self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base, dtype, self.config.rope_scaling)
@@ -306,6 +351,15 @@ class Attention(nn.Module):
             window_size=None,
             sink_size=0
         )
+        #new changes
+        self.kv_quantizer = KVQuantizer(
+            enabled=False,
+            quant_type="int8",
+            sink_size=0,
+            window_size=0
+        )
+
+
 
     def load_hook(self, state_dict, prefix, *args):
         if prefix + "wq.weight" in state_dict:
