@@ -122,19 +122,39 @@ def causal_mask(b, h, q, kv):
     return q >= kv
 
 def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> torch.Tensor:
-    # input_pos: [B, S]
-    mask = create_block_mask(causal_mask, 1, 1, input_pos.shape[0], model.max_seq_length, device=x.device)
-    logits = model(mask, x, input_pos)
+    print("[DEBUG] Inside prefill()")
+    print(f"[DEBUG] x.shape: {x.shape}, input_pos.shape: {input_pos.shape}")
+    kv_cache = model.layers[0].attention.kv_cache
+    kv_len = kv_cache.k_cache.shape[2] if kv_cache.compress else model.max_seq_length
+
+    mask = create_block_mask(
+        causal_mask, 1, 1,
+        Q_LEN := x.size(1),
+        kv_len,
+        device=x.device
+    )
+
+    logits = model(mask, x, input_pos, prefill_mode=True)
     return sample(logits, **sampling_kwargs)[0]
 
 def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, block_mask: BlockMask, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
-    # input_pos: [B, 1]
-    assert input_pos.shape[-1] == 1
+    assert input_pos.shape[-1] == 1, "input_pos must be shape [B, 1]"
+
+    # Step 1: Select the block slice
     block_index = input_pos // block_mask.BLOCK_SIZE[0]
-    mask = block_mask[:, :, block_index]
-    mask.mask_mod = block_mask.mask_mod
-    mask.seq_lengths = (1, model.max_seq_length)
-    logits = model(mask, x, input_pos)
+    mask = block_mask[:, :, block_index]  # [1, H, 1, block_size]
+    mask.mask_mod = block_mask.mask_mod  # pass-through (may be updated inside model)
+
+    # Step 2: Adjust kv_len to current compressed length
+    kv_cache = model.layers[0].attention.kv_cache
+    if kv_cache.compress:
+        mask.seq_lengths = (1, kv_cache.k_cache.shape[2])
+    else:
+        # full-length
+        mask.seq_lengths = (1, model.max_seq_length)
+
+    logits = model(mask, x, input_pos, prefill_mode=False)
+
     return sample(logits, **sampling_kwargs)
 
 def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, callback=lambda _: _, **sampling_kwargs):
@@ -222,7 +242,9 @@ def generate(
     """
     Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
     """
-
+    print("[DEBUG] Entered generate()")
+    print(f"[DEBUG] prompt shape: {prompt.shape}")
+    print(f"[DEBUG] batch_size = {batch_size}, max_new_tokens = {max_new_tokens}")
     is_speculative = draft_model is not None
     # create an empty tensor of the expected final shape and fill in the current tokens
     T = prompt.size(-1)
@@ -247,7 +269,9 @@ def generate(
     seq = empty
     input_pos = torch.arange(0, T, device=device)
 
+    print("[DEBUG] Calling prefill()")
     next_token = prefill(model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs).clone()
+    print("[DEBUG] Prefill completed, next token sampled.")
     if is_speculative:
         prefill(draft_model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs)
     seq[:, T] = next_token.squeeze()
@@ -272,6 +296,7 @@ def generate(
             input_pos = input_pos + num_added
             next_token = next_tokens[-1]
     else:
+        print("[DEBUG] Starting decode_n_tokens() loop")
         generated_tokens, _ = decode_n_tokens(model, next_token.view(batch_size, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
         seq[:, T + 1:] = torch.cat(generated_tokens, dim=-1)
 
@@ -354,6 +379,9 @@ def main(
     draft_checkpoint_path: Optional[Path] = None,
     speculate_k: int = 5,
     device=default_device,
+    compress_kv: bool = False,
+    window_size: int = None,
+    sink_size: int = 0,
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
     """
@@ -379,6 +407,15 @@ def main(
     print("Loading model ...")
     t0 = time.time()
     model = _load_model(checkpoint_path, device, precision, use_tp)
+    print("[DEBUG] Model loaded successfully.")
+    print(f"[DEBUG] Model config: {model.config}")
+    print(f"[DEBUG] Model total parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
+
+    if compress_kv:
+        for layer in model.layers:
+            layer.attention.kv_compressor.enabled = True
+            layer.attention.kv_compressor.window_size = window_size
+            layer.attention.kv_compressor.sink_size = sink_size
 
     if is_speculative:
         draft_model = _load_model(draft_checkpoint_path, device, precision, use_tp)
@@ -390,8 +427,11 @@ def main(
 
     tokenizer = get_tokenizer(tokenizer_path, checkpoint_path)
 
+    print("[DEBUG] Tokenizer loaded successfully.")
+
     if isinstance(prompt, str):
         encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
+        print(f"[DEBUG] Prompt encoded, shape: {encoded.shape}, first 10 tokens: {encoded[:10].tolist()}")
     else:
         # generate a fully synthetic prompt
         encoded = torch.randint(0, 1024, (prompt,), device=device, dtype=torch.int64)
@@ -445,7 +485,8 @@ def main(
                     buffer.clear()
                 # print(, end='', flush=True)
         else:
-            callback = lambda x : x
+            callback = lambda x: x
+
         t0 = time.perf_counter()
         import contextlib
         if (i != num_samples - 1 or not profile) or (use_tp and rank != 0):
@@ -556,10 +597,13 @@ if __name__ == '__main__':
     parser.add_argument('--speculate_k', type=int, default=5, help='Speculative execution depth.')
     parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
     parser.add_argument('--device', type=str, default=default_device, help='Device to use')
+    parser.add_argument('--compress_kv', action='store_true', help='Enable attention kv compression')
+    parser.add_argument('--window_size', type=int, default=None, help='Window size for attention sliding window')
+    parser.add_argument('--sink_size', type=int, default=0, help='Attention sink size')
 
     args = parser.parse_args()
     main(
         args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.batch_size, args.top_k,
         args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
-        args.speculate_k, args.device
+        args.speculate_k, args.device, args.compress_kv, args.window_size, args.sink_size
     )
