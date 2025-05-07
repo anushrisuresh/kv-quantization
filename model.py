@@ -205,38 +205,17 @@ class KVCache(nn.Module):
         k, v: [B, H, 1, D] during decode
         input_pos: [1] absolute position
         """
-        if not self.compress:
-<<<<<<< Updated upstream
+        if not self.compress and not self.quantize:
             self.k_cache[:, :, input_pos] = k  # no .squeeze() or .item()
             self.v_cache[:, :, input_pos] = v
-        else:
-            if self.compress:
-                assert self.prefill_done, "Must call prefill_update before update"
+        elif self.compress:
+            assert self.prefill_done, "Must call prefill_update before update"
             idx = self.sink + self.ptr
             self.k_cache[:, :, idx] = k.squeeze(2)
             self.v_cache[:, :, idx] = v.squeeze(2)
             self.kv_positions[idx] = input_pos.item()
             self.ptr = (self.ptr + 1) % self.window
-=======
-            # full mode: simply write into absolute pos
-            pos = input_pos.item()
-            self.k_cache[:, :, pos] = k_new.squeeze(2)
-            self.v_cache[:, :, pos] = v_new.squeeze(2)
-            return self.k_cache, self.v_cache
-
-        # compressed mode: sliding window update
-        assert self.prefill_done, "Must call prefill_update before update"
-        # circular write index
-        idx = self.sink + self.ptr
-        self.k_cache[:, :, idx] = k_new.squeeze(2)
-        self.v_cache[:, :, idx] = v_new.squeeze(2)
-        # map this slot to absolute position
-        pos = input_pos.item()
-        self.kv_positions[idx] = pos
-        # advance pointer
-        self.ptr = (self.ptr + 1) % self.window
-        #new change
-        if self.quantize and self.quantizer is not None:
+        elif self.quantize and self.quantizer is not None:
             # preserve sink and newest window: quantize everything else
             start = self.quantizer.sink_size
             end   = self.sink + self.window - self.quantizer.window_size
@@ -247,8 +226,6 @@ class KVCache(nn.Module):
                 # call into our helper
                 self.k_cache[:, :, start:end] = self.quantizer.quantize_tensor(k_mid)
                 self.v_cache[:, :, start:end] = self.quantizer.quantize_tensor(v_mid)
-
->>>>>>> Stashed changes
         return self.k_cache, self.v_cache
 
 class Transformer(nn.Module):
