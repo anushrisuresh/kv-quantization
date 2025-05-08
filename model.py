@@ -20,7 +20,6 @@ from torch.nn.attention.flex_attention import (
     create_block_mask
 )
 from kv_compression import KVCompressor
-#new changes
 from kv_quantization import KVQuantizer
 
 def find_multiple(n: int, k: int) -> int:
@@ -131,23 +130,22 @@ class KVCache(nn.Module):
         sink_size: int = 0,
         window_size: int = None,
         dtype: torch.dtype = torch.bfloat16,
-        #new change
         quantize: bool = False,
         quantizer: KVQuantizer = None
     ):
         super().__init__()
         self.compress = compress
-        #new change
         self.quantize = quantize
         self.quantizer = quantizer
-
-        if not compress:
+        
+        if not compress and not quantize:
             # Full KV cache: preallocate for max_seq_length
             cache_shape = (max_batch_size, n_heads, max_seq_length, head_dim)
             self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
             self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype))
-        else:
-            assert window_size is not None, "window_size must be set when compress=True"
+
+        elif compress:
+            assert window_size is not None, "window_size must be set when compress=True or quantize=True"
             self.sink = sink_size
             self.window = window_size
             self.total = sink_size + window_size
@@ -165,40 +163,144 @@ class KVCache(nn.Module):
             )
             self.ptr = 0
             self.prefill_done = False
+        
+        elif quantize:
+            assert window_size is not None, "window_size must be set when quantize=True"
+            self.sink = sink_size
+            self.window = window_size
+            self.total_fp = sink_size + window_size
+            self.max_seq = max_seq_length
+
+            shape_fp = (max_batch_size, n_heads, self.total_fp, head_dim)
+            self.register_buffer("k_cache", torch.zeros(shape_fp, dtype=dtype))
+            self.register_buffer("v_cache", torch.zeros_like(self.k_cache))
+
+            quant_cap = max_seq_length - self.total_fp
+            assert quant_cap > 0, "max_seq_length must exceed sink+window"
+
+            # int8 data
+            shape_q = (max_batch_size, n_heads, quant_cap, head_dim)
+            self.register_buffer("k_quant", torch.zeros(shape_q, dtype=torch.int8))
+            self.register_buffer("v_quant", torch.zeros_like(self.k_quant))
+
+            # per‑slot scale (float32, one per key vector)
+            scale_shape = (max_batch_size, n_heads, quant_cap, 1)
+            self.register_buffer("k_scale", torch.ones(scale_shape, dtype=torch.float32))
+            self.register_buffer("v_scale", torch.ones_like(self.k_scale))
+
+            # map absolute positions → buffer slot index
+            #   ≥0 & < total_fp : index into k_cache/v_cache  
+            #   <0 & ≥−quant_cap : `−1−slot` → index into k_quant/v_quant
+            self.register_buffer("kv_map", torch.zeros(max_seq_length, dtype=torch.int64))
+
+            # pointers & length
+            self.ptr = 0
+            self.fp_ptr = 0
+            self.q_ptr = 0
+            self.cache_len = 0
+            self.mid = max_seq_length - self.total_fp  # tokens that go to quant cache
+
 
     def prefill_update(self, k_new: Tensor, v_new: Tensor):
         """
-        Bulk-load prompt KV into cache. Only for compress mode.
-        k_new, v_new: [B=1, H, T_prefill, D]
+        Bulk‑load prompt KV into cache.  Handles three mutually exclusive modes:
+            • self.compress == True: sliding‑window compression
+            • self.quantize == True: partial int8 quantization of “middle” tokens
+            • else: no compression, no quantization (full precision)
+
+        Args:
+            k_new, v_new: [B, H, T_prefill, D]
+        Returns:
+            (k_cache_slice, v_cache_slice) to be used by attention
         """
-        if not self.compress:
-            return k_new, v_new
         T = k_new.size(2)
-        # Case: fits in buffer
-        if T <= self.total:
-            self.k_cache[:, :, :T] = k_new
-            self.v_cache[:, :, :T] = v_new
-            self.kv_positions[:T] = torch.arange(T, device=k_new.device)
-            compressed_k = self.k_cache[:, :, :T]
-            compressed_v = self.v_cache[:, :, :T]
-        else:
-            # keep sink + last window
+        
+        if self.compress:
+            if T <= self.total:
+                self.k_cache[:, :, :T] = k_new
+                self.v_cache[:, :, :T] = v_new
+                self.kv_positions[:T] = torch.arange(T, device=k_new.device)
+                compressed_k = self.k_cache[:, :, :T]
+                compressed_v = self.v_cache[:, :, :T]
+            else:
+                # keep sink + last window
+                self.k_cache[:, :, :self.sink] = k_new[:, :, :self.sink]
+                self.k_cache[:, :, self.sink:] = k_new[:, :, -self.window:]
+                self.v_cache[:, :, :self.sink] = v_new[:, :, :self.sink]
+                self.v_cache[:, :, self.sink:] = v_new[:, :, -self.window:]
+                # set positions
+                self.kv_positions[:self.sink] = torch.arange(self.sink, device=k_new.device)
+                self.kv_positions[self.sink:] = torch.arange(
+                    T - self.window, T, device=k_new.device
+                )
+                total = self.sink + self.window
+                compressed_k = self.k_cache[:, :, :total]
+                compressed_v = self.v_cache[:, :, :total]
+
+            self.ptr = 0
+            self.prefill_done = True
+            return compressed_k, compressed_v
+
+        elif self.quantize:
+            # (a) if we haven't yet exceeded sink+window, just fill FP cache
+            self.ptr = 0
+            self.q_ptr = 0
+            self.fp_ptr = 0
+            self.cache_len = 0
+            self.kv_map[:] = 0 
+
+            if T <= self.total_fp:
+                self.k_cache[:, :, :T] = k_new
+                self.v_cache[:, :, :T] = v_new
+                # map absolute pos → FP slot
+                self.kv_map[:T] = torch.arange(T, device=k_new.device)
+                self.cache_len = T
+                self.prefill_done = True
+                # attention will use FP slice
+                return self.k_cache[:, :, :T], self.v_cache[:, :, :T]
+
+            # (b) else: we have more tokens than sink+window → quantize the “middle”
+            mid_len = T - self.total_fp
+            device = k_new.device
+
+            # 1) sink (full‑precision)
             self.k_cache[:, :, :self.sink] = k_new[:, :, :self.sink]
-            self.k_cache[:, :, self.sink:] = k_new[:, :, -self.window:]
             self.v_cache[:, :, :self.sink] = v_new[:, :, :self.sink]
-            self.v_cache[:, :, self.sink:] = v_new[:, :, -self.window:]
-            # set positions
-            self.kv_positions[:self.sink] = torch.arange(self.sink, device=k_new.device)
-            self.kv_positions[self.sink:] = torch.arange(
-                T - self.window, T, device=k_new.device
-            )
-            total = self.sink + self.window
-            compressed_k = self.k_cache[:, :, :total]
-            compressed_v = self.v_cache[:, :, :total]
-        # reset circular pointer
-        self.ptr = 0
-        self.prefill_done = True
-        return compressed_k, compressed_v
+            self.kv_map[:self.sink] = torch.arange(self.sink, device=device)
+
+            # 2) middle (quantize into int8 + scale)
+            k_mid = k_new[:, :, self.sink : self.sink + mid_len]
+            v_mid = v_new[:, :, self.sink : self.sink + mid_len]
+            qk, scale_k = self.quantizer.true_quantize_tensor(k_mid)
+            qv, scale_v = self.quantizer.true_quantize_tensor(v_mid)
+            # write into pre‑allocated quant buffers
+            self.k_quant[:, :, :mid_len] = qk
+            self.k_scale[:, :, :mid_len, :] = scale_k
+            self.v_quant[:, :, :mid_len] = qv
+            self.v_scale[:, :, :mid_len, :] = scale_v
+            # map absolute positions → quant slots via negative coding
+            #   slot i in quant buffer is referenced as kv_map[p] = -1 - i
+            indices = -1 - torch.arange(mid_len, device=device)
+            self.kv_map[self.sink : self.sink + mid_len] = indices
+
+            # 3) window (full‑precision of last `window` tokens)
+            start_win = T - self.window
+            self.k_cache[:, :, self.sink :] = k_new[:, :, start_win : T]
+            self.v_cache[:, :, self.sink :] = v_new[:, :, start_win : T]
+            # map those last tokens
+            win_slots = torch.arange(self.window, device=device)
+            self.kv_map[start_win : T] = self.sink + win_slots
+
+            # finalize
+            self.cache_len = T
+            self.prefill_done = True
+            
+            # attention will pull from both FP and dequantized int8 via kv_map lookup
+            return self.k_cache, self.v_cache
+
+        else:
+            return k_new, v_new
+
 
     def update(self, input_pos: Tensor, k: Tensor, v: Tensor):
         """
@@ -208,6 +310,8 @@ class KVCache(nn.Module):
         if not self.compress and not self.quantize:
             self.k_cache[:, :, input_pos] = k  # no .squeeze() or .item()
             self.v_cache[:, :, input_pos] = v
+            return self.k_cache, self.v_cache
+
         elif self.compress:
             assert self.prefill_done, "Must call prefill_update before update"
             idx = self.sink + self.ptr
@@ -215,18 +319,54 @@ class KVCache(nn.Module):
             self.v_cache[:, :, idx] = v.squeeze(2)
             self.kv_positions[idx] = input_pos.item()
             self.ptr = (self.ptr + 1) % self.window
+            return self.k_cache, self.v_cache
+
         elif self.quantize and self.quantizer is not None:
-            # preserve sink and newest window: quantize everything else
-            start = self.quantizer.sink_size
-            end   = self.sink + self.window - self.quantizer.window_size
-            if end > start:
-                # slice the old‐tokens region
-                k_mid = self.k_cache[:, :, start:end]
-                v_mid = self.v_cache[:, :, start:end]
-                # call into our helper
-                self.k_cache[:, :, start:end] = self.quantizer.quantize_tensor(k_mid)
-                self.v_cache[:, :, start:end] = self.quantizer.quantize_tensor(v_mid)
-        return self.k_cache, self.v_cache
+            assert self.prefill_done, "Must call prefill_update before update"
+            pos = input_pos.item()
+            step = self.ptr  # how many tokens we've decoded since prefill
+
+            # (a) fill out the “mid” quantized region first
+            if step < self.mid:
+                # squeeze out the length‑1 dim
+                k_slice = k.squeeze(2)  # [B,H,D]
+                v_slice = v.squeeze(2)
+
+                # true quantize → int8 + per‑vector scale
+                # we unsqueeze back to shape [B,H,1,D] so true_quantize_tensor returns
+                # (qx: [B,H,1,D] int8, scale: [B,H,1,1] float32)
+                qk, scale_k = self.quantizer.true_quantize_tensor(k_slice.unsqueeze(2))
+                qv, scale_v = self.quantizer.true_quantize_tensor(v_slice.unsqueeze(2))
+                # store into your pre‑allocated quant buffers
+                self.k_quant[:, :, step]    = qk.squeeze(2)            # [B,H,D]
+                self.k_scale[:, :, step, 0] = scale_k.squeeze().unsqueeze(0)  # shape [1, 8]
+                self.v_quant[:, :, step]    = qv.squeeze(2)
+                self.v_scale[:, :, step, 0] = scale_v.squeeze().unsqueeze(0)  # shape [1, 8]
+
+                # record in kv_map so attention knows to look in quant cache
+                self.kv_map[pos] = -1 - step
+
+            # (b) once the “mid” is full, roll into your sliding‑window in fp
+            else:
+                window_idx = (step - self.mid) % self.window
+                full_idx = self.sink + window_idx
+
+                self.k_cache[:, :, full_idx] = k.squeeze(2)
+                self.v_cache[:, :, full_idx] = v.squeeze(2)
+
+                # map this position into the fp cache
+                self.kv_map[pos] = full_idx
+
+            # advance counters
+            self.ptr       += 1
+            self.cache_len += 1
+
+            # return the fp cache placeholders; attention will reconstruct the full keys/values
+            return self.k_cache, self.v_cache
+        else:
+            # should never get here
+            raise RuntimeError("KVCache.update: invalid mode")
+
 
 class Transformer(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
@@ -266,11 +406,14 @@ class Transformer(nn.Module):
                 head_dim=attn.head_dim,
                 dtype=attn.wqkv.weight.dtype,
                 compress=attn.kv_compressor.enabled if attn.kv_compressor else False,
-                sink_size=attn.kv_compressor.sink_size if attn.kv_compressor else 0,
-                window_size=attn.kv_compressor.window_size if attn.kv_compressor else 0,
-                #new changes
                 quantize=attn.kv_quantizer.enabled if attn.kv_quantizer else False,
-                quantizer=attn.kv_quantizer if attn.kv_quantizer else 0
+                quantizer=attn.kv_quantizer if attn.kv_quantizer else None,
+                sink_size=attn.kv_compressor.sink_size if attn.kv_compressor and attn.kv_compressor.enabled else (
+                    attn.kv_quantizer.sink_size if attn.kv_quantizer and attn.kv_quantizer.enabled else 0
+                ),
+                window_size=attn.kv_compressor.window_size if attn.kv_compressor and attn.kv_compressor.enabled else (
+                    attn.kv_quantizer.window_size if attn.kv_quantizer and attn.kv_quantizer.enabled else 0
+                ),
             )
 
         self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base, dtype, self.config.rope_scaling)
@@ -328,14 +471,12 @@ class Attention(nn.Module):
             window_size=None,
             sink_size=0
         )
-        #new changes
         self.kv_quantizer = KVQuantizer(
             enabled=False,
-            quant_type="int8",
+            quantize_type="int8",
             sink_size=0,
             window_size=0
         )
-
 
 
     def load_hook(self, state_dict, prefix, *args):
@@ -372,14 +513,13 @@ class Attention(nn.Module):
         q, k, v = [t.transpose(1, 2) for t in (q, k, v)]
 
         compress = getattr(self.kv_cache, "compress", False)
+        quantize = getattr(self.kv_cache, "quantize", False)
 
         # 4) populate KV cache
         if self.kv_cache is not None:
             if prefill_mode:
-                # Bulk‐load entire prompt phase
-                if compress:
+                if compress or quantize:
                     k,v = self.kv_cache.prefill_update(k, v)
-
                 else:
                     pos = input_pos.view(-1)
                     self.kv_cache.k_cache[:, :, pos] = k
@@ -412,7 +552,39 @@ class Attention(nn.Module):
                     def new_mask_mod(b, h, q_idx, kv_idx):
                         return orig_pos[kv_idx] <= cur_base + q_idx
                     mask.mask_mod = new_mask_mod
- 
+
+        elif quantize:
+            # how many total slots have been filled so far?
+            kv_map = self.kv_cache.kv_map           # [max_seq_length]
+            kv_len = min(self.kv_cache.cache_len, kv_map.size(0))
+            slot = kv_map[:kv_len]                  # e.g. tensor([0,1,2,-1,-2,3,...])
+
+            # clamp positives → [0..total_fp-1], and compute quant‑indices
+            pos_fp = slot.clamp(min=0)              # full‑precision indices
+            pos_q  = (-1 - slot).clamp(min=0)       # quantized indices
+
+            # gather full‑precision keys & values
+            k_fp = self.kv_cache.k_cache[:, :, pos_fp, :]        # [B,H,kv_len,D]
+            v_fp = self.kv_cache.v_cache[:, :, pos_fp, :]
+
+            # gather quantized and dequantize: int8 → float * scale
+            target_dtype = q.dtype  # e.g., torch.bfloat16 or torch.float16
+            # Dequantize and cast
+            k_q = (self.kv_cache.k_quant[:, :, pos_q, :].to(torch.float32) *
+                self.kv_cache.k_scale[:, :, pos_q, :]).to(target_dtype)
+
+            v_q = (self.kv_cache.v_quant[:, :, pos_q, :].to(torch.float32) *
+                self.kv_cache.v_scale[:, :, pos_q, :]).to(target_dtype)
+
+            # now select between the two per‑slot
+            selector = (slot >= 0).view(1, 1, -1, 1)               # broadcast mask
+            k = torch.where(selector, k_fp, k_q)
+            v = torch.where(selector, v_fp, v_q)
+
+            # adjust mask lengths
+            mask.seq_lengths = (q.shape[2], kv_len)
+            mask._adjust(q.shape[2], kv_len)
+
         # 7) perform attention
         y = flex_attention(
             q, k, v,
