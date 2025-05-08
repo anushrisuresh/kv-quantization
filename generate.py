@@ -11,6 +11,11 @@ from typing import Optional, Tuple, Union
 import json
 import os
 from collections import defaultdict
+from datasets import load_dataset
+from torch.nn import CrossEntropyLoss
+from tqdm import tqdm
+from torch.nn.functional import softmax
+from rouge_score import rouge_scorer
 
 import torch
 import torch._dynamo.config
@@ -234,7 +239,7 @@ def generate(
     batch_size: int,
     *,
     interactive: bool,
-    draft_model: Transformer,
+    draft_model: Transformer=None,
     speculate_k: Optional[int] = 8,
     callback = lambda x: x,
     **sampling_kwargs
@@ -309,6 +314,167 @@ def encode_tokens(tokenizer, string, bos=True, device=default_device):
     if bos:
         tokens = [tokenizer.bos_id()] + tokens
     return torch.tensor(tokens, dtype=torch.int, device=device)
+
+@torch.no_grad()
+def evaluate_ppl(model, tokenizer, seq_len=2048, stride=512, device="cuda"):
+    model.eval()
+    model.to(device)
+    with torch.device(device):
+        model.setup_caches(max_batch_size=1, max_seq_length=seq_len)
+
+    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+    texts = [t for t in dataset["text"] if len(t.strip()) > 0]
+    full_text = "\n\n".join(texts)
+
+    input_ids = encode_tokens(tokenizer, full_text, bos=True, device=device)
+    loss_fct = CrossEntropyLoss(ignore_index=-100, reduction='sum')
+    print(f"# tokens in dataset: {len(input_ids)}")
+
+    nlls = []
+    for i in tqdm(range(0, len(input_ids) - seq_len, stride)):
+        input_chunk = input_ids[i : i + seq_len]
+        target_chunk = input_chunk.clone()
+        target_chunk[:-stride] = -100  # mask out old positions, only predict last `stride` tokens
+
+        input_chunk = input_chunk.unsqueeze(0).to(device)  # add batch
+        target_chunk = target_chunk.unsqueeze(0).to(device)
+
+        input_pos = torch.arange(input_chunk.shape[-1]).to(device)
+        block_mask = create_block_mask(
+            causal_mask,
+            1,    # 通常是 1
+            1,  # local heads only
+            input_chunk.shape[-1],
+            input_chunk.shape[-1],
+            device=device,
+        )
+        print("input_chunk:",input_chunk)
+        print("dim:",input_chunk.size())
+        print
+        outputs = model(block_mask, input_chunk, input_pos=input_pos,prefill_mode=True)
+
+        logits = outputs[:, :-1, :].contiguous().view(-1, outputs.shape[-1])
+        targets = target_chunk[:, 1:].contiguous().view(-1).to(torch.long)
+        loss = loss_fct(logits, targets)
+        nlls.append(loss.item())
+
+    ppl = torch.exp(torch.tensor(sum(nlls) / (len(input_ids) - seq_len)))
+    return ppl.item()
+
+@torch.no_grad()
+def evaluate_summarization_rouge(
+    model,
+    tokenizer,
+    device="cuda",
+    max_len=1024,
+    max_summary_len=64,
+):
+    model.eval()
+    model.to(device)
+    with torch.device(device):
+        model.setup_caches(max_batch_size=1, max_seq_length=max_len + max_summary_len)
+
+    dataset = load_dataset("cnn_dailymail", "3.0.0", split="validation[:20]")
+    scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+
+    scores = []
+    total_tokens = 0
+    total_time = 0.0
+
+    for example in tqdm(dataset):
+        article = example["article"]
+        reference = example["highlights"]
+
+        # Prompt 改为清晰指令或 TL;DR 形式
+        prompt = f"Summarize the following article in one concise paragraph:\n\n{article}\n\nSummary:"
+        input_ids = encode_tokens(tokenizer, prompt, bos=True, device=device)
+        input_ids = input_ids[:max_len]
+
+        # === Start timing ===
+        start_time = time.time()
+
+        # === 调用 generate() 函数 ===
+        output_ids, _ = generate(
+            model=model,
+            prompt=input_ids,
+            max_new_tokens=max_summary_len,
+            batch_size=1,
+            interactive=False,
+            temperature=0.8,  # 可调
+            top_k=200         # 可调
+        )
+
+        # 只取新生成的部分（不包括 prompt）
+        generated = output_ids[0, input_ids.shape[-1]:].tolist()
+
+        # === End timing ===
+        end_time = time.time()
+        total_time += (end_time - start_time)
+        total_tokens += len(generated)
+
+        summary = tokenizer.decode(generated)
+        score = scorer.score(reference, summary)
+        scores.append(score["rougeL"].fmeasure)
+
+    avg_rouge_l = sum(scores) / len(scores)
+    tokens_per_second = total_tokens / total_time if total_time > 0 else 0.0
+
+    print(f"Average ROUGE-L: {avg_rouge_l:.4f}")
+    print(f"Tokens per second: {tokens_per_second:.2f} tok/s")
+
+    return avg_rouge_l, tokens_per_second
+
+@torch.no_grad()
+def evaluate_reasoning_accuracy(model, tokenizer, device="cuda", max_len=512):
+    model.eval()
+    model.to(device)
+    with torch.device(device):
+        model.setup_caches(max_batch_size=1, max_seq_length=max_len)
+
+    dataset = load_dataset("boolq", split="validation")
+
+    correct = 0
+    total = 0
+
+    for example in tqdm(dataset):
+        question = example["question"]
+        passage = example["passage"]
+        label = example["answer"]  # True / False
+
+        # 构造 prompt，确保与 tokenizer 兼容
+        prompt = f"Question: {question}\nPassage: {passage}\nAnswer yes or no:"
+        input_ids = encode_tokens(tokenizer, prompt, bos=True, device=device)
+        if input_ids.shape[0] > max_len:
+            input_ids = input_ids[-max_len:]  # 截断后面的内容
+
+        input_chunk = input_ids.unsqueeze(0).to(device)
+        input_pos = torch.arange(input_chunk.shape[-1], device=device)
+
+        block_mask = create_block_mask(
+            causal_mask,
+            1,  # batch
+            1,  # heads
+            input_chunk.shape[-1],
+            max_len,
+            device=device,
+        )
+
+        outputs = model(block_mask, input_chunk, input_pos=input_pos,prefill_mode=True)  # [1, seq_len, vocab]
+        logits = outputs[0, -1, :]  # last token logits
+        probs = softmax(logits, dim=-1)
+
+        # 获取 " yes" 和 " no" 的 token id
+        yes_id = encode_tokens(tokenizer, " yes", bos=False, device=device)[0].item()
+        no_id = encode_tokens(tokenizer, " no", bos=False, device=device)[0].item()
+
+        pred = probs[yes_id] > probs[no_id]
+        if pred.item() == label:
+            correct += 1
+        total += 1
+
+    accuracy = correct / total
+    print(f"Accuracy on BoolQ: {accuracy:.4f}")
+    return accuracy
 
 def _load_model(checkpoint_path, device, precision, use_tp):
     use_cuda = 'cuda' in device
@@ -433,148 +599,158 @@ def main(
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
 
     tokenizer = get_tokenizer(tokenizer_path, checkpoint_path)
+    print("Running perplexity evaluation on WikiText-2...")
+    ppl = evaluate_ppl(model, tokenizer, device="cuda", seq_len=2048, stride=512)
+    print(f"Perplexity: {ppl:.2f}")
+    # print("Evaluating reasoning accuracy on BoolQ...")
+    # acc = evaluate_reasoning_accuracy(model, tokenizer, device=device, max_len=2048)
+    # print(f"BoolQ Accuracy: {acc:.2%}")
+    
+    print("Evaluating summarization on CNN/DailyMail (ROUGE-L)...")
+    rouge_l,tps = evaluate_summarization_rouge(model, tokenizer, device=device, max_len=1024, max_summary_len=64)
+    print(f"Average ROUGE-L: {rouge_l:.4f}")
+    print("tps:",tps)
+    # if isinstance(prompt, str):
+    #     encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
+    # else:
+    #     # generate a fully synthetic prompt
+    #     encoded = torch.randint(0, 1024, (prompt,), device=device, dtype=torch.int64)
+    # prompt_length = encoded.size(-1)
 
-    if isinstance(prompt, str):
-        encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
-    else:
-        # generate a fully synthetic prompt
-        encoded = torch.randint(0, 1024, (prompt,), device=device, dtype=torch.int64)
-    prompt_length = encoded.size(-1)
+    # torch.manual_seed(1234)
+    # model_size, params = _get_model_size(model)
+    # if compile:
+    #     if is_speculative and use_tp: # and ("cuda" in device):
+    #         torch._inductor.config.triton.cudagraph_trees = False # Bug with cudagraph trees in this case
 
-    torch.manual_seed(1234)
-    model_size, params = _get_model_size(model)
-    if compile:
-        if is_speculative and use_tp: # and ("cuda" in device):
-            torch._inductor.config.triton.cudagraph_trees = False # Bug with cudagraph trees in this case
+    #     if is_speculative:
+    #         global model_forward, logits_to_prob
+    #         model_forward = torch.compile(model_forward, mode="reduce-overhead", fullgraph=True)
 
-        if is_speculative:
-            global model_forward, logits_to_prob
-            model_forward = torch.compile(model_forward, mode="reduce-overhead", fullgraph=True)
+    #     global decode_one_token, prefill
+    #     decode_one_token = torch.compile(decode_one_token, mode="reduce-overhead", fullgraph=True)
 
-        global decode_one_token, prefill
-        decode_one_token = torch.compile(decode_one_token, mode="reduce-overhead", fullgraph=True)
-
-        # Uncomment to squeeze more perf out of prefill
-        if compile_prefill:
-            prefill = torch.compile(prefill, fullgraph=True, dynamic=True)
+    #     # Uncomment to squeeze more perf out of prefill
+    #     if compile_prefill:
+    #         prefill = torch.compile(prefill, fullgraph=True, dynamic=True)
 
 
-    aggregate_metrics = {
-        'tokens_per_sec': [],
-        'accept_counts': [],
-    }
-    start = -1 if compile else 0
+    # aggregate_metrics = {
+    #     'tokens_per_sec': [],
+    #     'accept_counts': [],
+    # }
+    # start = -1 if compile else 0
 
-    for i in range(start, num_samples):
-        device_sync(device=device) # MKG
-        if i >= 0 and interactive:
-            prompt = input("What is your prompt? ")
-            if is_chat:
-                prompt = f"{B_INST} {prompt.strip()} {E_INST}"
-            encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
+    # for i in range(start, num_samples):
+    #     device_sync(device=device) # MKG
+    #     if i >= 0 and interactive:
+    #         prompt = input("What is your prompt? ")
+    #         if is_chat:
+    #             prompt = f"{B_INST} {prompt.strip()} {E_INST}"
+    #         encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
 
-        if interactive and i >= 0:
-            buffer = []
-            period_id = tokenizer.encode('.')[0]
-            done_generating = False
-            def callback(x):
-                nonlocal done_generating
-                if done_generating:
-                    return
-                buffer.append(tokenizer.decode([period_id] + x.tolist())[1:])
-                if x.item() == tokenizer.eos_id():
-                    done_generating = True
-                if len(buffer) == 4 or done_generating:
-                    print(''.join(buffer), end='', flush=True)
-                    buffer.clear()
-                # print(, end='', flush=True)
-        else:
-            callback = lambda x: x
+    #     if interactive and i >= 0:
+    #         buffer = []
+    #         period_id = tokenizer.encode('.')[0]
+    #         done_generating = False
+    #         def callback(x):
+    #             nonlocal done_generating
+    #             if done_generating:
+    #                 return
+    #             buffer.append(tokenizer.decode([period_id] + x.tolist())[1:])
+    #             if x.item() == tokenizer.eos_id():
+    #                 done_generating = True
+    #             if len(buffer) == 4 or done_generating:
+    #                 print(''.join(buffer), end='', flush=True)
+    #                 buffer.clear()
+    #             # print(, end='', flush=True)
+    #     else:
+    #         callback = lambda x: x
 
-        t0 = time.perf_counter()
-        import contextlib
-        if (i != num_samples - 1 or not profile) or (use_tp and rank != 0):
-            prof = contextlib.nullcontext()
-        else:
-            torch.profiler._utils._init_for_cuda_graphs()
-            prof = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.CUDA,
-                ],
-                record_shapes=True,
-                with_flops = True,
-                profile_memory=True,
-            )
-        with prof:
-            y, metrics = generate(
-                model,
-                encoded,
-                max_new_tokens,
-                batch_size=batch_size,
-                draft_model=draft_model,
-                speculate_k=speculate_k,
-                interactive=interactive,
-                callback=callback,
-                temperature=temperature,
-                top_k=top_k,
-            )
-            aggregate_metrics['accept_counts'].append(metrics['accept_counts'])
-        if i == -1:
-            print(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
-            continue
-        if hasattr(prof, "export_chrome_trace") and profile:
-            json_path = f"{profile}_rank_{rank}.json" if use_tp else f"{profile}.json"
-            prof.export_chrome_trace(json_path)
-            print(f"[Profiler] Chrome trace saved to {json_path}")
+    #     t0 = time.perf_counter()
+    #     import contextlib
+    #     if (i != num_samples - 1 or not profile) or (use_tp and rank != 0):
+    #         prof = contextlib.nullcontext()
+    #     else:
+    #         torch.profiler._utils._init_for_cuda_graphs()
+    #         prof = torch.profiler.profile(
+    #             activities=[
+    #                 torch.profiler.ProfilerActivity.CPU,
+    #                 torch.profiler.ProfilerActivity.CUDA,
+    #             ],
+    #             record_shapes=True,
+    #             with_flops = True,
+    #             profile_memory=True,
+    #         )
+    #     with prof:
+    #         y, metrics = generate(
+    #             model,
+    #             encoded,
+    #             max_new_tokens,
+    #             batch_size=batch_size,
+    #             draft_model=draft_model,
+    #             speculate_k=speculate_k,
+    #             interactive=interactive,
+    #             callback=callback,
+    #             temperature=temperature,
+    #             top_k=top_k,
+    #         )
+    #         aggregate_metrics['accept_counts'].append(metrics['accept_counts'])
+    #     if i == -1:
+    #         print(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
+    #         continue
+    #     if hasattr(prof, "export_chrome_trace") and profile:
+    #         json_path = f"{profile}_rank_{rank}.json" if use_tp else f"{profile}.json"
+    #         prof.export_chrome_trace(json_path)
+    #         print(f"[Profiler] Chrome trace saved to {json_path}")
 
-            # New: Write memory and timing summary
-            from pathlib import Path
-            output_dir = Path("outputs")
-            output_dir.mkdir(exist_ok=True)
-            txt_path = output_dir / (Path(profile).stem + "_summary.txt")
+    #         # New: Write memory and timing summary
+    #         from pathlib import Path
+    #         output_dir = Path("outputs")
+    #         output_dir.mkdir(exist_ok=True)
+    #         txt_path = output_dir / (Path(profile).stem + "_summary.txt")
 
-            with open(txt_path, "w") as f:
-                f.write("=== PyTorch Profiler Summary ===\n\n")
-                f.write(f"Trace ID: {json_path}\n")
-                f.write(f"{'Name':40} | CPU Mem (MB) | GPU Mem (MB) | Time (us) | #Calls\n")
-                f.write("-" * 80 + "\n")
-                for item in prof.key_averages().table(sort_by="cuda_memory_usage", row_limit=50).splitlines():
-                    f.write(item + "\n")
-                f.write("\n--- End of Summary ---\n")
+    #         with open(txt_path, "w") as f:
+    #             f.write("=== PyTorch Profiler Summary ===\n\n")
+    #             f.write(f"Trace ID: {json_path}\n")
+    #             f.write(f"{'Name':40} | CPU Mem (MB) | GPU Mem (MB) | Time (us) | #Calls\n")
+    #             f.write("-" * 80 + "\n")
+    #             for item in prof.key_averages().table(sort_by="cuda_memory_usage", row_limit=50).splitlines():
+    #                 f.write(item + "\n")
+    #             f.write("\n--- End of Summary ---\n")
 
-            print(f"[Profiler] Detailed summary saved to {txt_path}")
+    #         print(f"[Profiler] Detailed summary saved to {txt_path}")
 
-        device_sync(device=device) # MKG
-        t = time.perf_counter() - t0
+    #     device_sync(device=device) # MKG
+    #     t = time.perf_counter() - t0
 
-        if not interactive:
-            # Just displaying the first generation
-            if batch_size > 1:
-                print("Only displaying the first generation of the batch")
-            print(tokenizer.decode(y[0].tolist()))
-        else:
-            print()
-        tokens_generated = y.size(-1) - prompt_length
-        generated_tokens_sec = tokens_generated / t
-        aggregate_metrics['tokens_per_sec'].append(generated_tokens_sec)
-        print(f"Time for inference {i + 1}: {t:.02f} sec total, {generated_tokens_sec:.02f} tokens/sec")
-        print(f"Bandwidth achieved: {model_size * generated_tokens_sec / 1e9:.02f} GB/s")
-        total_tokens_sec = y.numel() / t
-        print(f"FLOPS achieved: {params * total_tokens_sec * 2 / 1e12:.02f} TF/s")
-        print()
-    print("==========")
-    if is_speculative:
-        counts_aggregated = [sum(i) for i in zip(*aggregate_metrics['accept_counts'])]
-        acceptance_probs = [i/sum(counts_aggregated) for i in counts_aggregated]
-        print(f"Acceptance probs: {acceptance_probs}")
-        print(f"Mean Accepted: {sum([idx * i for idx, i in enumerate(counts_aggregated)])/sum(counts_aggregated)}")
+    #     if not interactive:
+    #         # Just displaying the first generation
+    #         if batch_size > 1:
+    #             print("Only displaying the first generation of the batch")
+    #         print(tokenizer.decode(y[0].tolist()))
+    #     else:
+    #         print()
+    #     tokens_generated = y.size(-1) - prompt_length
+    #     generated_tokens_sec = tokens_generated / t
+    #     aggregate_metrics['tokens_per_sec'].append(generated_tokens_sec)
+    #     print(f"Time for inference {i + 1}: {t:.02f} sec total, {generated_tokens_sec:.02f} tokens/sec")
+    #     print(f"Bandwidth achieved: {model_size * generated_tokens_sec / 1e9:.02f} GB/s")
+    #     total_tokens_sec = y.numel() / t
+    #     print(f"FLOPS achieved: {params * total_tokens_sec * 2 / 1e12:.02f} TF/s")
+    #     print()
+    # print("==========")
+    # if is_speculative:
+    #     counts_aggregated = [sum(i) for i in zip(*aggregate_metrics['accept_counts'])]
+    #     acceptance_probs = [i/sum(counts_aggregated) for i in counts_aggregated]
+    #     print(f"Acceptance probs: {acceptance_probs}")
+    #     print(f"Mean Accepted: {sum([idx * i for idx, i in enumerate(counts_aggregated)])/sum(counts_aggregated)}")
 
-    print(f"Batch Size: {batch_size}")
-    print(f"Prompt Length: {prompt_length}")
-    print(f"Generated tokens: {max_new_tokens}")
-    print(f"Average tokens/sec: {torch.mean(torch.tensor(aggregate_metrics['tokens_per_sec'])).item():.2f}")
-    print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
+    # print(f"Batch Size: {batch_size}")
+    # print(f"Prompt Length: {prompt_length}")
+    # print(f"Generated tokens: {max_new_tokens}")
+    # print(f"Average tokens/sec: {torch.mean(torch.tensor(aggregate_metrics['tokens_per_sec'])).item():.2f}")
+    # print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
 
 
 if __name__ == '__main__':
@@ -594,7 +770,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size to benchmark with')
     parser.add_argument('--top_k', type=int, default=200, help='Top-k for sampling.')
     parser.add_argument('--temperature', type=float, default=0.8, help='Temperature for sampling.')
-    parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')
+    parser.add_argument('--checkpoint_path', type=Path, default=Path("/home/cs601-mnair12/kv-quantization/checkpoints/Meta-Llama-3.1-8B/model.pth"), help='Model checkpoint path.')
     parser.add_argument('--compile', action='store_true', help='Whether to compile the model.')
     parser.add_argument('--compile_prefill', action='store_true', help='Whether to compile the prefill (improves prefill perf, but higher compile times)')
     parser.add_argument('--profile', type=Path, default=None, help='Profile path.')
@@ -604,8 +780,8 @@ if __name__ == '__main__':
     parser.add_argument('--compress_kv', action='store_true', help='Enable attention kv compression')
     parser.add_argument('--quantize_kv', action='store_true', help='Enable partial quantization of KV cache')
     parser.add_argument('--quantize_type', type=str, default='int8', help='Quantization type (e.g., int8, int4)')    
-    parser.add_argument('--window_size', type=int, default=None, help='Window size for attention sliding window')
-    parser.add_argument('--sink_size', type=int, default=0, help='Attention sink size')
+    parser.add_argument('--window_size', type=int, default=100, help='Window size for attention sliding window')
+    parser.add_argument('--sink_size', type=int, default=16, help='Attention sink size')
 
     args = parser.parse_args()
     #new change
