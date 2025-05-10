@@ -11,7 +11,9 @@ Modern large language models (LLMs) rely on a **Key–Value (KV) cache** to stor
 2. **Aggressively quantizing** older tokens to int8, and  
 3. **Dequantizing on‐the‐fly** only when needed for attention.
 
-![ERD](images/different_models.png)
+<div align="center">
+  <img src="images/different_models.png" alt="drawing" width="500"/>
+</div>
 
 This hybrid strategy delivers up to **2× memory savings** with **no increase in perplexity** (5.56) and only a **minor drop in ROUGE-L** (0.2073 → 0.1709).
 
@@ -20,11 +22,15 @@ This hybrid strategy delivers up to **2× memory savings** with **no increase in
 ## 📊 Results
 
 ### Figure 1. Memory Breakdown  
-![KV Cache Memory Breakdown (Fig.1)](images/memory_consumption.png)  
+<div align="center">
+  <img src="images/memory_consumption.png" alt="KV Cache Memory Breakdown (Fig.1)" width="500"/>
+</div>
 > **KV cache accounts for over 90% of total GPU memory**, making it the primary target for optimization.
 
 ### Figure 2. Memory vs. Sequence Length  
-![Memory Usage vs max_new_tokens (Fig.2)](images/memory_vs_new_tokens.png)  
+<div align="center">
+  <img src="images/memory_vs_new_tokens.png" alt="Memory Usage vs max_new_tokens (Fig.2)" width="700"/>
+</div>
 > **Selective quantization** (green) and **compressed cache** (orange) both flatten memory growth compared to **full cache** (blue), achieving ~2× and ~4× reductions respectively at 200 tokens.
 
 ### Figure 3. Perplexity & ROUGE-L  
