@@ -269,7 +269,6 @@ def generate(
     seq = empty
     input_pos = torch.arange(0, T, device=device)
 
-    print("[DEBUG] Calling prefill()")
     next_token = prefill(model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs).clone()
     print("[DEBUG] Prefill completed, next token sampled.")
     if is_speculative:
@@ -380,6 +379,8 @@ def main(
     speculate_k: int = 5,
     device=default_device,
     compress_kv: bool = False,
+    quantize_kv: bool = False,
+    quantize_type: str = "int8",
     window_size: int = None,
     sink_size: int = 0,
 ) -> None:
@@ -407,15 +408,21 @@ def main(
     print("Loading model ...")
     t0 = time.time()
     model = _load_model(checkpoint_path, device, precision, use_tp)
-    print("[DEBUG] Model loaded successfully.")
-    print(f"[DEBUG] Model config: {model.config}")
     print(f"[DEBUG] Model total parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
 
+    # Enable KV Compression
     if compress_kv:
         for layer in model.layers:
             layer.attention.kv_compressor.enabled = True
             layer.attention.kv_compressor.window_size = window_size
             layer.attention.kv_compressor.sink_size = sink_size
+    
+    if quantize_kv:
+        for layer in model.layers:
+            layer.attention.kv_quantizer.enabled = True
+            layer.attention.kv_quantizer.quantize_type = quantize_type
+            layer.attention.kv_quantizer.window_size = window_size
+            layer.attention.kv_quantizer.sink_size = sink_size
 
     if is_speculative:
         draft_model = _load_model(draft_checkpoint_path, device, precision, use_tp)
@@ -426,12 +433,9 @@ def main(
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
 
     tokenizer = get_tokenizer(tokenizer_path, checkpoint_path)
-
-    print("[DEBUG] Tokenizer loaded successfully.")
-
+    
     if isinstance(prompt, str):
         encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
-        print(f"[DEBUG] Prompt encoded, shape: {encoded.shape}, first 10 tokens: {encoded[:10].tolist()}")
     else:
         # generate a fully synthetic prompt
         encoded = torch.randint(0, 1024, (prompt,), device=device, dtype=torch.int64)
@@ -598,12 +602,16 @@ if __name__ == '__main__':
     parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
     parser.add_argument('--device', type=str, default=default_device, help='Device to use')
     parser.add_argument('--compress_kv', action='store_true', help='Enable attention kv compression')
-    parser.add_argument('--window_size', type=int, default=None, help='Window size for attention sliding window')
-    parser.add_argument('--sink_size', type=int, default=0, help='Attention sink size')
+    parser.add_argument('--quantize_kv', action='store_true', help='Enable partial quantization of KV cache')
+    parser.add_argument('--quantize_type', type=str, default='int8', help='Quantization type (e.g., int8, int4)')    
+    parser.add_argument('--window_size', type=int, default=32, help='Window size for attention sliding window')
+    parser.add_argument('--sink_size', type=int, default=16, help='Attention sink size')
 
     args = parser.parse_args()
+    #new change
+    assert not (args.compress_kv and args.quantize_kv), "Cannot compress_kv and quantize_kv together"
     main(
         args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.batch_size, args.top_k,
         args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
-        args.speculate_k, args.device, args.compress_kv, args.window_size, args.sink_size
+        args.speculate_k, args.device, args.compress_kv, args.quantize_kv, args.quantize_type, args.window_size, args.sink_size
     )
